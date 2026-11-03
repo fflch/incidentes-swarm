@@ -5,7 +5,7 @@ import dateutil.parser
 import docker
 import mysql.connector
 
-# Configurações do Banco via Variáveis de Ambiente (padrões genéricos para repo público)
+# Configurações do Banco via Variáveis de Ambiente
 DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
 DB_PORT = int(os.getenv("DB_PORT", "3306"))
 DB_NAME = os.getenv("DB_NAME", "database")
@@ -37,23 +37,29 @@ def fetch_failed_tasks():
         
         # Filtra apenas falhas reais
         if state in ["failed", "rejected"]:
+            service_id = task.get("ServiceID")
+            
+            # Busca os detalhes do serviço para verificar se é um replicated-job
+            try:
+                service = client.services.get(service_id)
+                service_mode = service.attrs.get("Spec", {}).get("Mode", {})
+                
+                # SE NÃO FOR REPLICATED-JOB, PULA PARA A PRÓXIMA TASK
+                if "ReplicatedJob" not in service_mode:
+                    continue
+
+                service_name = service.name
+                labels = service.attrs.get("Spec", {}).get("Labels", {})
+                stack_name = labels.get("com.docker.stack.namespace", "")
+            except Exception:
+                # Se o serviço foi removido ou não pôde ser consultado, ignora
+                continue
+
             task_id = task.get("ID")
             timestamp_str = task_status.get("Timestamp")
             data_ocorrencia = dateutil.parser.parse(timestamp_str) if timestamp_str else datetime.utcnow()
             
             error_msg = task_status.get("Err", "Erro desconhecido informado pelo Swarm")
-            
-            service_id = task.get("ServiceID")
-            service_name = "desconhecido"
-            stack_name = ""
-            
-            try:
-                service = client.services.get(service_id)
-                service_name = service.name
-                labels = service.attrs.get("Spec", {}).get("Labels", {})
-                stack_name = labels.get("com.docker.stack.namespace", "")
-            except Exception:
-                pass
 
             # Formata como "stack/servico" ou apenas "servico" (respeitando limite de 100 caracteres)
             full_service_name = f"{stack_name}/{service_name}" if stack_name else service_name
@@ -69,10 +75,9 @@ def fetch_failed_tasks():
                 except Exception:
                     logs = "(Não foi possível capturar os logs do container)"
 
-            mensagem_completa = f"Erro Swarm: {error_msg}\n\n--- Últimos Logs ---\n{logs}"
+            mensagem_completa = f"Erro Swarm (Job): {error_msg}\n\n--- Últimos Logs ---\n{logs}"
 
             # Inserção no MariaDB/MySQL
-            # Usa INSERT IGNORE para ignorar a inserção se id_externo já existir na tabela
             insert_query = """
                 INSERT IGNORE INTO alerts (
                     type, 
@@ -99,7 +104,7 @@ def fetch_failed_tasks():
     conn.close()
 
 if __name__ == "__main__":
-    print("Iniciando monitoramento de falhas do Docker Swarm...")
+    print("Iniciando monitoramento de falhas de Jobs no Docker Swarm...")
     while True:
         try:
             fetch_failed_tasks()
