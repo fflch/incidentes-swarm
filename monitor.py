@@ -25,8 +25,8 @@ def get_db_connection():
 def fetch_failed_tasks():
     client = docker.from_env()
     
-    # Consulta tarefas com estado desejado de desligamento/falha
-    tasks = client.tasks(filters={"desired-state": "shutdown"})
+    # Consulta tarefas com estado desejado de desligamento/falha via APIClient (client.api)
+    tasks = client.api.tasks(filters={"desired-state": "shutdown"})
     
     conn = get_db_connection()
     cursor = conn.cursor()
