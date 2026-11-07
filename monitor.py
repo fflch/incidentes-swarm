@@ -3,7 +3,7 @@ import time
 import re
 import json
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 import dateutil.parser
 import docker
 import mysql.connector
@@ -24,6 +24,14 @@ def get_db_connection():
         user=DB_USER,
         password=DB_PASS
     )
+
+def adjust_datetime(dt=None):
+    """Retorna o datetime (ou o atual) ajustado com a subtração de 3 horas (sem timezone)."""
+    if dt is None:
+        dt = datetime.utcnow()
+    if hasattr(dt, 'tzinfo') and dt.tzinfo is not None:
+        dt = dt.replace(tzinfo=None)
+    return dt - timedelta(hours=3)
 
 
 def fetch_failed_tasks():
@@ -59,7 +67,8 @@ def fetch_failed_tasks():
 
                 task_id = task.get("ID")
                 timestamp_str = task_status.get("Timestamp")
-                data_ocorrencia = dateutil.parser.parse(timestamp_str) if timestamp_str else datetime.utcnow()
+                raw_date = dateutil.parser.parse(timestamp_str) if timestamp_str else None
+                data_ocorrencia = adjust_datetime(raw_date)
                 
                 error_msg = task_status.get("Err", "Erro desconhecido informado pelo Swarm")
 
@@ -133,11 +142,12 @@ def fetch_container_log_errors(last_check_timestamp):
                 date_match = re.search(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]', entry)
                 if date_match:
                     try:
-                        data_ocorrencia = datetime.strptime(date_match.group(1), "%Y-%m-%d %H:%M:%S")
+                        parsed_dt = datetime.strptime(date_match.group(1), "%Y-%m-%d %H:%M:%S")
+                        data_ocorrencia = adjust_datetime(parsed_dt)
                     except ValueError:
-                        data_ocorrencia = datetime.utcnow()
+                        data_ocorrencia = adjust_datetime()
                 else:
-                    data_ocorrencia = datetime.utcnow()
+                    data_ocorrencia = adjust_datetime()
 
                 first_line = entry.strip().split('\n')[0]
                 error_fingerprint = f"{service_name}:{first_line}:{data_ocorrencia.strftime('%Y-%m-%d-%H')}"
@@ -172,7 +182,7 @@ def fetch_container_log_errors(last_check_timestamp):
 
 def fetch_drupal_stack_errors():
     """
-    Captura erros de Watchdog (4 severidades) e do Relatório de Status (drush rq --severity=2)
+    Captura erros de Watchdog (severidades 1, 2 e 3) e do Relatório de Status (drush rq --severity=2)
     em cada stack Drupal do Swarm (executando em APENAS UMA réplica por site).
     """
     conn = None
@@ -183,26 +193,21 @@ def fetch_drupal_stack_errors():
         cursor = conn.cursor()
 
         containers = client.containers.list(filters={"status": "running"})
-        
-        # Agrupa containers por stack do Swarm para rodar Drush em APENAS UMA réplica por site
         drupal_stacks = {}
 
         for container in containers:
             image_name = container.image.tags[0] if container.image.tags else ""
             container_name = container.name
 
-            # Identifica se é um container Drupal principal
             if "drupal" not in image_name.lower() and "drupal" not in container_name.lower():
                 continue
 
-            # Ignora os containers de cron ou de migração initupdb
             if "cron" in container_name.lower() or "initupdb" in container_name.lower():
                 continue
 
             labels = container.labels
             stack_name = labels.get("com.docker.stack.namespace", container_name)
 
-            # Guarda apenas o primeiro container encontrado por stack (evita duplicar drush nas réplicas)
             if stack_name not in drupal_stacks:
                 drupal_stacks[stack_name] = container
 
@@ -215,7 +220,7 @@ def fetch_drupal_stack_errors():
             full_service_name = full_service_name[:100]
 
             # ----------------------------------------------------
-            # 1. MONITORAMENTO DO WATCHDOG (4 Severidades)
+            # 1. MONITORAMENTO DO WATCHDOG (Severidades 1, 2 e 3)
             # ----------------------------------------------------
             for severidade in severidades_criticas:
                 try:
@@ -239,7 +244,6 @@ def fetch_drupal_stack_errors():
                         if not wid:
                             continue
 
-                        # ID Único absoluto via WID do banco do Drupal
                         id_externo = f"drupal-watchdog-{stack_name}-{wid}"
 
                         type_str = item.get("type", "drupal")
@@ -249,9 +253,10 @@ def fetch_drupal_stack_errors():
                         location = item.get("location", "N/A")
 
                         try:
-                            data_ocorrencia = dateutil.parser.parse(date_str) if date_str else datetime.utcnow()
+                            parsed_dt = dateutil.parser.parse(date_str) if date_str else None
+                            data_ocorrencia = adjust_datetime(parsed_dt)
                         except Exception:
-                            data_ocorrencia = datetime.utcnow()
+                            data_ocorrencia = adjust_datetime()
 
                         mensagem_completa = (
                             f"Erro Drupal Watchdog [ID: {wid}] [{severity_str}]\n"
@@ -298,8 +303,8 @@ def fetch_drupal_stack_errors():
                             value = req_data.get("value", "")
                             description = req_data.get("description", "")
 
-                            # ID Único diário por item de erro do Status Report por site
-                            id_externo = f"drupal-rq-{stack_name}-{req_key}-{datetime.utcnow().strftime('%Y-%m-%d')}"
+                            data_ocorrencia = adjust_datetime()
+                            id_externo = f"drupal-rq-{stack_name}-{req_key}-{data_ocorrencia.strftime('%Y-%m-%d')}"
 
                             mensagem_completa = (
                                 f"Erro no Relatório de Status do Drupal (Status Report)\n"
@@ -312,13 +317,14 @@ def fetch_drupal_stack_errors():
                             insert_query = """
                                 INSERT IGNORE INTO alerts (
                                     type, id_externo, service_name, data_ocorrencia, mensagem, status_resolucao, created_at, updated_at
-                                ) VALUES (%s, %s, %s, NOW(), %s, 'pendente', NOW(), NOW())
+                                ) VALUES (%s, %s, %s, %s, %s, 'pendente', NOW(), NOW())
                             """
 
                             cursor.execute(insert_query, (
                                 'drupal',
                                 id_externo,
                                 full_service_name,
+                                data_ocorrencia,
                                 mensagem_completa
                             ))
                             conn.commit()
