@@ -206,7 +206,7 @@ def fetch_drupal_stack_errors():
             if stack_name not in drupal_stacks:
                 drupal_stacks[stack_name] = container
 
-        severidades_criticas = ["Emergência", "Alerta", "Crítico", "Erro"]
+        severidades_criticas = ["1", "2", "3"]
 
         for stack_name, container in drupal_stacks.items():
             labels = container.labels
