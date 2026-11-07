@@ -25,8 +25,11 @@ def get_db_connection():
         password=DB_PASS
     )
 
+
 def fetch_failed_tasks():
-    """Captura falhas de Replicated Jobs (ex: php artisan migrate, drush updb)."""
+    """Captura falhas de Replicated Jobs (ex: php artisan migrate, drush updb/initupdb)."""
+    conn = None
+    cursor = None
     try:
         client = docker.from_env()
         tasks = client.api.tasks(filters={"desired-state": "shutdown"})
@@ -77,14 +80,7 @@ def fetch_failed_tasks():
 
                 insert_query = """
                     INSERT IGNORE INTO alerts (
-                        type, 
-                        id_externo, 
-                        service_name, 
-                        data_ocorrencia, 
-                        mensagem, 
-                        status_resolucao, 
-                        created_at, 
-                        updated_at
+                        type, id_externo, service_name, data_ocorrencia, mensagem, status_resolucao, created_at, updated_at
                     ) VALUES (%s, %s, %s, %s, %s, 'pendente', NOW(), NOW())
                 """
                 
@@ -97,14 +93,17 @@ def fetch_failed_tasks():
                 ))
                 conn.commit()
 
-        cursor.close()
-        conn.close()
     except Exception as e:
         print(f"Erro ao buscar tarefas com falhas no Swarm: {e}")
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 
 def fetch_container_log_errors(last_check_timestamp):
     """Captura exceções 500 emitidas nos logs (stderr/stdout) de aplicações Laravel."""
+    conn = None
+    cursor = None
     try:
         client = docker.from_env()
         conn = get_db_connection()
@@ -125,7 +124,6 @@ def fetch_container_log_errors(last_check_timestamp):
             if not raw_logs.strip():
                 continue
 
-            # Separador das entradas de log do Laravel usando regex com o timestamp [YYYY-MM-DD HH:MM:SS]
             log_entries = re.split(r'(?=\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\])', raw_logs)
 
             for entry in log_entries:
@@ -142,7 +140,6 @@ def fetch_container_log_errors(last_check_timestamp):
                     data_ocorrencia = datetime.utcnow()
 
                 first_line = entry.strip().split('\n')[0]
-                # Agrupa hash MD5 por erro + serviço + hora para evitar duplicação em loop
                 error_fingerprint = f"{service_name}:{first_line}:{data_ocorrencia.strftime('%Y-%m-%d-%H')}"
                 id_externo = hashlib.md5(error_fingerprint.encode('utf-8')).hexdigest()
 
@@ -153,14 +150,7 @@ def fetch_container_log_errors(last_check_timestamp):
 
                 insert_query = """
                     INSERT IGNORE INTO alerts (
-                        type, 
-                        id_externo, 
-                        service_name, 
-                        data_ocorrencia, 
-                        mensagem, 
-                        status_resolucao, 
-                        created_at, 
-                        updated_at
+                        type, id_externo, service_name, data_ocorrencia, mensagem, status_resolucao, created_at, updated_at
                     ) VALUES (%s, %s, %s, %s, %s, 'pendente', NOW(), NOW())
                 """
 
@@ -173,40 +163,60 @@ def fetch_container_log_errors(last_check_timestamp):
                 ))
                 conn.commit()
 
-        cursor.close()
-        conn.close()
     except Exception as e:
         print(f"Erro ao buscar logs de erros Laravel: {e}")
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 
-def fetch_drupal_watchdog_errors():
-    """Captura erros graves (Emergência, Alerta, Crítico, Erro) do Watchdog do Drupal via Drush."""
+def fetch_drupal_stack_errors():
+    """
+    Captura erros de Watchdog (4 severidades) e do Relatório de Status (drush rq --severity=2)
+    em cada stack Drupal do Swarm (executando em APENAS UMA réplica por site).
+    """
+    conn = None
+    cursor = None
     try:
         client = docker.from_env()
         conn = get_db_connection()
         cursor = conn.cursor()
 
         containers = client.containers.list(filters={"status": "running"})
-        severidades_criticas = ["Emergência", "Alerta", "Crítico", "Erro"]
+        
+        # Agrupa containers por stack do Swarm para rodar Drush em APENAS UMA réplica por site
+        drupal_stacks = {}
 
         for container in containers:
             image_name = container.image.tags[0] if container.image.tags else ""
             container_name = container.name
 
-            # Filtra apenas containers Drupal
+            # Identifica se é um container Drupal principal
             if "drupal" not in image_name.lower() and "drupal" not in container_name.lower():
                 continue
 
-            # Ignora containers de cron ou initupdb
+            # Ignora os containers de cron ou de migração initupdb
             if "cron" in container_name.lower() or "initupdb" in container_name.lower():
                 continue
 
             labels = container.labels
+            stack_name = labels.get("com.docker.stack.namespace", container_name)
+
+            # Guarda apenas o primeiro container encontrado por stack (evita duplicar drush nas réplicas)
+            if stack_name not in drupal_stacks:
+                drupal_stacks[stack_name] = container
+
+        severidades_criticas = ["Emergência", "Alerta", "Crítico", "Erro"]
+
+        for stack_name, container in drupal_stacks.items():
+            labels = container.labels
             service_name = labels.get("com.docker.swarm.service.name", container.name)
-            stack_name = labels.get("com.docker.stack.namespace", "")
             full_service_name = f"{stack_name}/{service_name}" if stack_name else service_name
             full_service_name = full_service_name[:100]
 
+            # ----------------------------------------------------
+            # 1. MONITORAMENTO DO WATCHDOG (4 Severidades)
+            # ----------------------------------------------------
             for severidade in severidades_criticas:
                 try:
                     exec_res = container.exec_run(
@@ -222,81 +232,121 @@ def fetch_drupal_watchdog_errors():
                         continue
 
                     logs = json.loads(output)
-                except Exception:
-                    continue
+                    items = logs.values() if isinstance(logs, dict) else logs
 
-                items = logs.values() if isinstance(logs, dict) else logs
+                    for item in items:
+                        wid = item.get("wid") or item.get("id")
+                        if not wid:
+                            continue
 
-                for item in items:
-                    wid = item.get("wid") or item.get("id")
-                    if not wid:
-                        continue
+                        # ID Único absoluto via WID do banco do Drupal
+                        id_externo = f"drupal-watchdog-{stack_name}-{wid}"
 
-                    # Identificador único usando o WID nativo do Drupal por serviço
-                    id_externo = f"drupal-{service_name}-{wid}"
+                        type_str = item.get("type", "drupal")
+                        severity_str = item.get("severity", severidade)
+                        message_raw = item.get("message", "")
+                        date_str = item.get("date", "")
+                        location = item.get("location", "N/A")
 
-                    type_str = item.get("type", "drupal")
-                    severity_str = item.get("severity", severidade)
-                    message_raw = item.get("message", "")
-                    date_str = item.get("date", "")
-                    location = item.get("location", "N/A")
+                        try:
+                            data_ocorrencia = dateutil.parser.parse(date_str) if date_str else datetime.utcnow()
+                        except Exception:
+                            data_ocorrencia = datetime.utcnow()
 
-                    try:
-                        data_ocorrencia = dateutil.parser.parse(date_str) if date_str else datetime.utcnow()
-                    except Exception:
-                        data_ocorrencia = datetime.utcnow()
+                        mensagem_completa = (
+                            f"Erro Drupal Watchdog [ID: {wid}] [{severity_str}]\n"
+                            f"Tipo: {type_str}\n"
+                            f"URL/Location: {location}\n"
+                            f"Comando para investigar: vendor/bin/drush watchdog:show {wid}\n\n"
+                            f"Detalhes: {message_raw}"
+                        )
 
-                    mensagem_completa = (
-                        f"Erro Drupal Watchdog [ID: {wid}] [{severity_str}]\n"
-                        f"Tipo: {type_str}\n"
-                        f"URL/Location: {location}\n"
-                        f"Comando para investigar: vendor/bin/drush watchdog:show {wid}\n\n"
-                        f"Detalhes: {message_raw}"
-                    )
+                        insert_query = """
+                            INSERT IGNORE INTO alerts (
+                                type, id_externo, service_name, data_ocorrencia, mensagem, status_resolucao, created_at, updated_at
+                            ) VALUES (%s, %s, %s, %s, %s, 'pendente', NOW(), NOW())
+                        """
 
-                    insert_query = """
-                        INSERT IGNORE INTO alerts (
-                            type, 
-                            id_externo, 
-                            service_name, 
-                            data_ocorrencia, 
-                            mensagem, 
-                            status_resolucao, 
-                            created_at, 
-                            updated_at
-                        ) VALUES (%s, %s, %s, %s, %s, 'pendente', NOW(), NOW())
-                    """
+                        cursor.execute(insert_query, (
+                            'drupal',
+                            id_externo,
+                            full_service_name,
+                            data_ocorrencia,
+                            mensagem_completa
+                        ))
+                        conn.commit()
+                except Exception as e:
+                    print(f"Erro ao consultar watchdog [{severidade}] na stack {stack_name}: {e}")
 
-                    cursor.execute(insert_query, (
-                        'drupal',
-                        id_externo,
-                        full_service_name,
-                        data_ocorrencia,
-                        mensagem_completa
-                    ))
-                    conn.commit()
+            # ----------------------------------------------------
+            # 2. MONITORAMENTO DO RELATÓRIO DE STATUS (drush rq)
+            # ----------------------------------------------------
+            try:
+                exec_rq = container.exec_run(
+                    "vendor/bin/drush rq --severity=2 --format=json",
+                    workdir="/var/www/html"
+                )
 
-        cursor.close()
-        conn.close()
+                if exec_rq.exit_code == 0:
+                    output_rq = exec_rq.output.decode('utf-8', errors='ignore').strip()
+                    if output_rq and output_rq != "[]" and output_rq != "{}":
+                        rq_items = json.loads(output_rq)
+                        items_dict = rq_items if isinstance(rq_items, dict) else {}
+
+                        for req_key, req_data in items_dict.items():
+                            title = req_data.get("title", req_key)
+                            value = req_data.get("value", "")
+                            description = req_data.get("description", "")
+
+                            # ID Único diário por item de erro do Status Report por site
+                            id_externo = f"drupal-rq-{stack_name}-{req_key}-{datetime.utcnow().strftime('%Y-%m-%d')}"
+
+                            mensagem_completa = (
+                                f"Erro no Relatório de Status do Drupal (Status Report)\n"
+                                f"Item: {title}\n"
+                                f"Valor: {value}\n"
+                                f"Descrição: {description}\n"
+                                f"Comando para investigar: vendor/bin/drush status-report"
+                            )
+
+                            insert_query = """
+                                INSERT IGNORE INTO alerts (
+                                    type, id_externo, service_name, data_ocorrencia, mensagem, status_resolucao, created_at, updated_at
+                                ) VALUES (%s, %s, %s, NOW(), %s, 'pendente', NOW(), NOW())
+                            """
+
+                            cursor.execute(insert_query, (
+                                'drupal',
+                                id_externo,
+                                full_service_name,
+                                mensagem_completa
+                            ))
+                            conn.commit()
+            except Exception as e:
+                print(f"Erro ao consultar status report na stack {stack_name}: {e}")
+
     except Exception as e:
-        print(f"Erro ao consultar watchdog do Drupal: {e}")
+        print(f"Erro na função geral de verificação do Drupal: {e}")
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 
 if __name__ == "__main__":
-    print("Iniciando monitoramento unificado (Jobs Swarm, Laravel 500 e Drupal Watchdog)...")
+    print("Iniciando monitoramento unificado (Jobs Swarm, Laravel 500, Drupal Watchdog e Status Report)...")
     last_check_timestamp = time.time() - POLL_INTERVAL
 
     while True:
         current_time = time.time()
         try:
-            # 1. Checa falhas em Jobs Swarm (artisan migrate, drush updb, etc.)
+            # 1. Checa falhas em Jobs Swarm (artisan migrate, drush updb/initupdb, etc.)
             fetch_failed_tasks()
 
             # 2. Checa erros 500 em containers Laravel em execução (stderr)
             fetch_container_log_errors(last_check_timestamp)
 
-            # 3. Checa erros de severidade crítica (0 a 3) no Watchdog do Drupal via Drush
-            fetch_drupal_watchdog_errors()
+            # 3. Checa erros de Watchdog e Status Report em cada site Drupal no Swarm
+            fetch_drupal_stack_errors()
 
             last_check_timestamp = current_time
         except Exception as e:
