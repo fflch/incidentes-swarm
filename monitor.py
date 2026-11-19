@@ -34,6 +34,112 @@ def adjust_datetime(dt=None):
     return dt - timedelta(hours=3)
 
 
+HOST_RULE_RE = re.compile(r"Host\(\s*`([^`]+)`\s*\)")
+
+
+def _pick_host(hosts):
+    """Escolhe o host principal: prefere o que não começa com 'www.' e, entre eles, o mais curto."""
+    hosts = [h.strip().lower() for h in hosts if h and h.strip()]
+    if not hosts:
+        return None
+    sem_www = [h for h in hosts if not h.startswith("www.")]
+    candidatos = sem_www or hosts
+    return sorted(candidatos, key=len)[0]
+
+
+def build_stack_url_map(client):
+    """
+    Monta um dicionário {stack_name: host} a partir dos serviços do Swarm.
+    1º tenta as regras do Traefik (traefik.http.routers.*.rule=Host(`...`)) nas labels do serviço;
+    2º usa as variáveis de ambiente SITE_HOST (Drupal) ou APP_URL (Laravel).
+    Todos os serviços da stack (worker, cron, migrate, initupdb...) herdam o host encontrado.
+    """
+    traefik_hosts = {}
+    env_hosts = {}
+    try:
+        services = client.services.list()
+    except Exception as e:
+        print(f"Erro ao listar serviços para resolver URLs: {e}")
+        return {}
+
+    for service in services:
+        spec = service.attrs.get("Spec", {})
+        labels = spec.get("Labels", {}) or {}
+        stack_name = labels.get("com.docker.stack.namespace")
+        if not stack_name:
+            continue
+
+        for key, value in labels.items():
+            if key.startswith("traefik.http.routers.") and key.endswith(".rule"):
+                traefik_hosts.setdefault(stack_name, []).extend(HOST_RULE_RE.findall(value or ""))
+
+        env_list = spec.get("TaskTemplate", {}).get("ContainerSpec", {}).get("Env", []) or []
+        for env in env_list:
+            name, _, val = env.partition("=")
+            if name == "SITE_HOST" and val:
+                env_hosts.setdefault(stack_name, []).append(val)
+            elif name == "APP_URL" and val:
+                host = re.sub(r"^https?://", "", val).split("/")[0]
+                env_hosts.setdefault(stack_name, []).append(host)
+
+    url_map = {}
+    for stack_name in set(traefik_hosts) | set(env_hosts):
+        host = _pick_host(traefik_hosts.get(stack_name, [])) or _pick_host(env_hosts.get(stack_name, []))
+        if host:
+            url_map[stack_name] = host
+    return url_map
+
+
+def _detect_service_type(spec):
+    """Identifica o framework de um serviço pelo spec: 'drupal', 'laravel' ou None."""
+    container_spec = spec.get("TaskTemplate", {}).get("ContainerSpec", {})
+    image = (container_spec.get("Image") or "").lower()
+    if "drupal" in image:
+        return "drupal"
+
+    env_names = {e.partition("=")[0] for e in (container_spec.get("Env") or [])}
+    command = " ".join((container_spec.get("Command") or []) + (container_spec.get("Args") or []))
+    if "APP_KEY" in env_names or "artisan" in command:
+        return "laravel"
+    if "SITE_HOST" in env_names or "drush" in command:
+        return "drupal"
+    return None
+
+
+def build_stack_type_map(client):
+    """Monta {stack_name: 'drupal' | 'laravel'} a partir dos serviços de cada stack."""
+    type_map = {}
+    try:
+        services = client.services.list()
+    except Exception as e:
+        print(f"Erro ao listar serviços para resolver tipos: {e}")
+        return {}
+
+    for service in services:
+        spec = service.attrs.get("Spec", {})
+        stack_name = (spec.get("Labels", {}) or {}).get("com.docker.stack.namespace")
+        if not stack_name:
+            continue
+        service_type = _detect_service_type(spec)
+        # 'drupal' tem prioridade, pois é a detecção mais específica (pela imagem)
+        if service_type and type_map.get(stack_name) != "drupal":
+            type_map[stack_name] = service_type
+    return type_map
+
+
+def resolve_type(type_map, stack_name, default="docker"):
+    """Retorna o tipo do alerta para a stack ('drupal', 'laravel' ou o padrão)."""
+    return type_map.get(stack_name, default) if stack_name else default
+
+
+def resolve_display_name(url_map, stack_name, service_name):
+    """Retorna a URL da aplicação; se não houver, cai para 'stack/servico'."""
+    name = url_map.get(stack_name) if stack_name else None
+    if not name:
+        name = f"{stack_name}/{service_name}" if stack_name else service_name
+    return name[:100]
+
+
 def fetch_failed_tasks():
     """Captura falhas de Replicated Jobs (ex: php artisan migrate, drush updb/initupdb)."""
     conn = None
@@ -41,6 +147,8 @@ def fetch_failed_tasks():
     try:
         client = docker.from_env()
         tasks = client.api.tasks(filters={"desired-state": "shutdown"})
+        url_map = build_stack_url_map(client)
+        type_map = build_stack_type_map(client)
         
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -72,8 +180,7 @@ def fetch_failed_tasks():
                 
                 error_msg = task_status.get("Err", "Erro desconhecido informado pelo Swarm")
 
-                full_service_name = f"{stack_name}/{service_name}" if stack_name else service_name
-                full_service_name = full_service_name[:100]
+                full_service_name = resolve_display_name(url_map, stack_name, service_name)
 
                 container_status = task_status.get("ContainerStatus", {})
                 container_id = container_status.get("ContainerID")
@@ -94,7 +201,7 @@ def fetch_failed_tasks():
                 """
                 
                 cursor.execute(insert_query, (
-                    'docker',
+                    resolve_type(type_map, stack_name),
                     task_id,
                     full_service_name,
                     data_ocorrencia,
@@ -119,6 +226,8 @@ def fetch_container_log_errors(last_check_timestamp):
         cursor = conn.cursor()
 
         containers = client.containers.list(filters={"status": "running"})
+        url_map = build_stack_url_map(client)
+        type_map = build_stack_type_map(client)
 
         for container in containers:
             labels = container.labels
@@ -153,8 +262,7 @@ def fetch_container_log_errors(last_check_timestamp):
                 error_fingerprint = f"{service_name}:{first_line}:{data_ocorrencia.strftime('%Y-%m-%d-%H')}"
                 id_externo = hashlib.md5(error_fingerprint.encode('utf-8')).hexdigest()
 
-                full_service_name = f"{stack_name}/{service_name}" if stack_name else service_name
-                full_service_name = full_service_name[:100]
+                full_service_name = resolve_display_name(url_map, stack_name, service_name)
 
                 mensagem_completa = f"Erro de App (Laravel 500):\n{entry.strip()}"
 
@@ -165,7 +273,7 @@ def fetch_container_log_errors(last_check_timestamp):
                 """
 
                 cursor.execute(insert_query, (
-                    'docker',
+                    resolve_type(type_map, stack_name),
                     id_externo,
                     full_service_name,
                     data_ocorrencia,
@@ -193,6 +301,8 @@ def fetch_drupal_stack_errors():
         cursor = conn.cursor()
 
         containers = client.containers.list(filters={"status": "running"})
+        url_map = build_stack_url_map(client)
+        type_map = build_stack_type_map(client)
         drupal_stacks = {}
 
         for container in containers:
@@ -216,8 +326,7 @@ def fetch_drupal_stack_errors():
         for stack_name, container in drupal_stacks.items():
             labels = container.labels
             service_name = labels.get("com.docker.swarm.service.name", container.name)
-            full_service_name = f"{stack_name}/{service_name}" if stack_name else service_name
-            full_service_name = full_service_name[:100]
+            full_service_name = resolve_display_name(url_map, stack_name, service_name)
 
             # ----------------------------------------------------
             # 1. MONITORAMENTO DO WATCHDOG (Severidades 1, 2 e 3)
@@ -273,7 +382,7 @@ def fetch_drupal_stack_errors():
                         """
 
                         cursor.execute(insert_query, (
-                            'drupal',
+                            resolve_type(type_map, stack_name, default='drupal'),
                             id_externo,
                             full_service_name,
                             data_ocorrencia,
@@ -321,7 +430,7 @@ def fetch_drupal_stack_errors():
                             """
 
                             cursor.execute(insert_query, (
-                                'drupal',
+                                resolve_type(type_map, stack_name, default='drupal'),
                                 id_externo,
                                 full_service_name,
                                 data_ocorrencia,
